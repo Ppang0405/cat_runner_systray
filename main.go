@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
+	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -13,7 +14,7 @@ import (
 )
 
 var icons [][]byte
-var cpuUsage float64
+var showCPUUsage bool
 var mu sync.Mutex
 
 func main() {
@@ -21,27 +22,44 @@ func main() {
 }
 
 func onReady() {
-	// systray.SetTitle("Cat Runner")
 	systray.SetTooltip("CPU Usage")
 	mQuit := systray.AddMenuItem("Quit", "Quit the whole app")
+	mShowUsage := systray.AddMenuItemCheckbox("Show CPU Usage", "Toggle CPU usage in menu bar", false)
 
 	go func() {
-		<-mQuit.ClickedCh
-		systray.Quit()
+		for {
+			select {
+			case <-mQuit.ClickedCh:
+				systray.Quit()
+				return
+			case <-mShowUsage.ClickedCh:
+				mu.Lock()
+				// Toggle the internal state
+				showCPUUsage = !showCPUUsage
+				// Update the UI to match the new state
+				if showCPUUsage {
+					mShowUsage.Check()
+				} else {
+					mShowUsage.Uncheck()
+				}
+				mu.Unlock()
+			}
+		}
 	}()
 
 	// Load icons
 	for i := 0; i < 5; i++ {
 		iconPath := filepath.Join("assets", fmt.Sprintf("%d.png", i))
-		icon, err := ioutil.ReadFile(iconPath)
+		icon, err := os.ReadFile(iconPath)
 		if err != nil {
 			log.Fatalf("Could not load icon: %v", err)
 		}
 		icons = append(icons, icon)
 	}
 
-	go animateCat()
-	go monitorCPU()
+	speedUpdateChan := make(chan time.Duration)
+	go animateCat(speedUpdateChan)
+	go monitorCPU(speedUpdateChan)
 }
 
 func onExit() {
@@ -49,40 +67,55 @@ func onExit() {
 	log.Println("Exiting")
 }
 
-func animateCat() {
+func animateCat(speedUpdateChan <-chan time.Duration) {
+	sleepDuration := 500 * time.Millisecond
+	ticker := time.NewTicker(sleepDuration)
 	iconIndex := 0
+
 	for {
-		mu.Lock()
-		currentCPUUsage := cpuUsage
-		mu.Unlock()
-
-		var sleepDuration time.Duration
-		if currentCPUUsage > 50 {
-			sleepDuration = 100 * time.Millisecond
-		} else if currentCPUUsage > 20 {
-			sleepDuration = 300 * time.Millisecond
-		} else {
-			sleepDuration = 500 * time.Millisecond
+		select {
+		case newDuration := <-speedUpdateChan:
+			if newDuration != sleepDuration {
+				ticker.Reset(newDuration)
+				sleepDuration = newDuration
+			}
+		case <-ticker.C:
+			systray.SetIcon(icons[iconIndex])
+			iconIndex = (iconIndex + 1) % len(icons)
 		}
-
-		systray.SetIcon(icons[iconIndex])
-		iconIndex = (iconIndex + 1) % len(icons)
-		time.Sleep(sleepDuration)
 	}
 }
 
-func monitorCPU() {
+func monitorCPU(speedUpdateChan chan<- time.Duration) {
 	for {
 		percentages, err := cpu.Percent(time.Second, false)
 		if err != nil {
 			log.Printf("Error getting CPU usage: %v", err)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 		if len(percentages) > 0 {
+			cpuUsage := percentages[0]
+
 			mu.Lock()
-			cpuUsage = percentages[0]
+			show := showCPUUsage
 			mu.Unlock()
-			systray.SetTooltip(fmt.Sprintf("CPU Usage: %.2f%%", cpuUsage))
+
+			usageStr := fmt.Sprintf("CPU Usage: %.1f%%", cpuUsage)
+			systray.SetTooltip(usageStr)
+
+			if show {
+				systray.SetTitle(fmt.Sprintf(" %.1f%%", cpuUsage))
+			} else {
+				systray.SetTitle("")
+			}
+
+			divisor := math.Max(1.0, math.Min(20.0, cpuUsage/5.0))
+			intervalSeconds := 0.2 / divisor
+			newSpeed := time.Duration(intervalSeconds * float64(time.Second))
+
+			speedUpdateChan <- newSpeed
 		}
+		time.Sleep(1 * time.Second)
 	}
 }
